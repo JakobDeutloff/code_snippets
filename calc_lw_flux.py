@@ -1,7 +1,9 @@
-# %% 
-import pyarts 
+# %%
+import pyarts
 import numpy as np
-import xarray as xr 
+import xarray as xr
+import FluxSimulator as fsm
+import zarr
 
 # %%
 def calc_spectral_fluxes_from_profiles(
@@ -18,26 +20,18 @@ def calc_spectral_fluxes_from_profiles(
     """Calculate spectral fluxes at top of the atmosphere (TOA) and surface for a given atmosphere profiles.
 
     Parameters:
-
-        pressure_profile (ndarray): Pressure profile [Pa].
-        temperature_profile (ndarray): Temperature profile [K].
-        h2o_profile (ndarray): Water vapor profile [VMR].
-        N2 (float): Nitrogen volume mixing ratio. Defaults to 0.78.
-        O2 (float): Oxygen volume mixing ratio. Defaults to 0.21.
-        CO2 (float): Carbon dioxide volume mixing ratio. Defaults to 400 ppm.
-        CH4 (float): Methane volume mixing ratio. Defaults to 1.8 ppm.
-        O3 (float): Ozone volume mixing ratio. Defaults to 0.
-        surface_altitude (float): Surface altitude [m]. Defaults to 0.
-        nstreams (int): Even number of streams to integrate the radiative fluxes.
-        fnum (int): Number of points in frequency grid.
-        fmin (float): Lower frequency limit [Hz].
-        fmax (float): Upper frequency limit [Hz].
-        verbosity (int): Reporting levels between 0 (only error messages)
-            and 3 (everything).
+    -----------
+    atmosphere : xarray.Dataset
+        Atmospheric profiles containing pressure, temperature, and gas concentrations.
+        Structure: coords=[pressure, lat, lon], variables=[temperature, gases]
+    species : list
+        List of species to be included in the radiative transfer calculations.
+    gases : list
+        List of gases to be included in the radiative transfer calculations.
 
     Returns:
-        ndarray, ndarray: Frequency grid [Hz], spectral fluxes (toa_up, toa_down, sfc_up, sfc_down) [Wm^-2]
-
+    --------
+    rad_field : np.ndarray
     """
 
     ws = pyarts.workspace.Workspace(verbosity=0)
@@ -61,7 +55,7 @@ def calc_spectral_fluxes_from_profiles(
     ws.abs_lines_per_speciesReadSpeciesSplitCatalog(basename="lines/")
 
     # Load CKDMT400 model data
-    if ('H2O-SelfContCKDMT400' in species) or ('H2O-ForeignContCKDMT400' in species):
+    if ("H2O-SelfContCKDMT400" in species) or ("H2O-ForeignContCKDMT400" in species):
         ws.ReadXML(ws.predefined_model_data, "model/mt_ckd_4.0/H2O.xml")
 
     # Read cross section data
@@ -81,9 +75,9 @@ def calc_spectral_fluxes_from_profiles(
     # Weakly reflecting surface
     ws.VectorSetConstant(ws.surface_scalar_reflectivity, 1, 0.0)
 
-    # This needs to be aloop ver lat lon
-    lat = atmosphere['lat'][0]
-    lon = atmosphere['lon'][0]
+    # This needs to be a loop over lat lon
+    lat = atmosphere["lat"][0]
+    lon = atmosphere["lon"][0]
 
     # extract profiles
     pressure = atmosphere.sel(lat=lat, lon=lon)["pressure"].values
@@ -99,8 +93,10 @@ def calc_spectral_fluxes_from_profiles(
     ws.p_grid = pressure
     ws.t_field = temperature[:, np.newaxis, np.newaxis]
 
-    # How does arts know which gas is at which pois of vmr? 
+    # How does arts know which gas is at which pos of vmr?
     vmr_field = np.zeros((len(gases), len(atmosphere["pressure"].values), 1, 1))
+
+    # here we need some loop over gases to fill vmr_field
     vmr_field[0, :, 0, 0] = atmosphere["h2o"].values
     vmr_field[1, :, 0, 0] = atmosphere["co2"].values
     vmr_field[2, :, 0, 0] = atmosphere["ch4"].values
@@ -112,7 +108,9 @@ def calc_spectral_fluxes_from_profiles(
     ws.z_surface = np.array([[surface_altitude]])
     ws.p_hse = 100000
     ws.z_hse_accuracy = 100.0
-    ws.z_field = 16e3 * (5 - np.log10(atmosphere['pressure'].values[:, np.newaxis, np.newaxis]))
+    ws.z_field = 16e3 * (
+        5 - np.log10(atmosphere["pressure"].values[:, np.newaxis, np.newaxis])
+    )
     ws.atmfields_checkedCalc()
     ws.z_fieldFromHSE()
 
@@ -154,17 +152,92 @@ def calc_spectral_fluxes_from_profiles(
 
 # %% call function
 species = [
-            "H2O, H2O-SelfContCKDMT400, H2O-ForeignContCKDMT400",
-            "CO2, CO2-CKDMT252",
-            "CH4",
-            "O2,O2-CIAfunCKDMT100",
-            "N2, N2-CIAfunCKDMT252, N2-CIArotCKDMT252",
-            "O3",
-        ]
-atmosphere = xr.open_dataset('/Users/jakobdeutloff/Desktop/atms.nc').rename({'geometric height': 'geometric_height'})
-gases = ['H2O', 'CO2', 'CH4', 'O2', 'N2', 'O3']
+    "H2O, H2O-SelfContCKDMT400, H2O-ForeignContCKDMT400",
+    "CO2, CO2-CKDMT252",
+    "CH4",
+    "O2,O2-CIAfunCKDMT100",
+    "N2, N2-CIAfunCKDMT252, N2-CIArotCKDMT252",
+    "O3",
+]
+atmosphere = xr.open_dataset("/Users/jakobdeutloff/Desktop/atms.nc").rename(
+    {"geometric height": "geometric_height"}
+)
+gases = ["H2O", "CO2", "CH4", "O2", "N2", "O3"]
+atmosphere = atmosphere.sel(lat=slice(-30, 30), lon=slice(-10, 10))
 
-flux = calc_spectral_fluxes_from_profiles(atmosphere, species, gases)
+
+# %% convert atms to gridded field
+atms_grd = pyarts.arts.ArrayOfGriddedField4()
+
+for i, lat_i in enumerate(atmosphere.lat):
+    for j, lon_j in enumerate(atmosphere.lon):
+        profile = atmosphere.sel(lat=lat_i, lon=lon_j)
+        ##add here
+        profile_grd = fsm.generate_gridded_field_from_profiles(
+            profile["pressure"].values,
+            profile["temperature"].values,
+            gases={"H2O": profile['H2O'], "CO2": profile['CO2'], 'O3': profile['O3'], 'N2': profile['N2'], 'O2': profile['O2']},
+        )
+        atms_grd.append(profile_grd)
+
+#%% setup ARTS
+f_grid = np.linspace(1, 5e3, 200)
+f_grid_freq = pyarts.arts.convert.kaycm2freq(f_grid)
+surface_reflectivity_lw = 0.05
+
+LW_flux_simulator = fsm.FluxSimulator("test_atms")
+LW_flux_simulator.ws.f_grid = f_grid_freq
+LW_flux_simulator.set_species(
+    [
+        "H2O, H2O-SelfContCKDMT350, H2O-ForeignContCKDMT350",
+        "O2-*-1e12-1e99,O2-CIAfunCKDMT100",
+        "N2, N2-CIAfunCKDMT252, N2-CIArotCKDMT252",
+        "CO2, CO2-CKDMT252",
+        "O3",
+        "O3-XFIT",
+    ]
+)
+
+# %% get lookup table
+LW_flux_simulator.get_lookuptableBatch(atms_grd)
+
+
+# %%
+fluxes_spectral = xr.Dataset(
+    {
+        "flux_upward": (("lat", "lon", "pressure", "f_grid"), np.zeros((len(atmosphere.lat), len(atmosphere.lon), len(atmosphere.pressure), len(f_grid)))),
+        "flux_downward": (("lat", "lon", "pressure", "f_grid"), np.zeros((len(atmosphere.lat), len(atmosphere.lon), len(atmosphere.pressure), len(f_grid)))),
+    },
+    coords={"lat": atmosphere.lat, "lon": atmosphere.lon, "f_grid": f_grid},
+)
+
+fluxes_integrated = xr.Dataset(
+    {
+        "flux_upward": (("lat", "lon", "pressure"), np.zeros((len(atmosphere.lat), len(atmosphere.lon), len(atmosphere.pressure)))),
+        "flux_downward": (("lat", "lon", "pressure"), np.zeros((len(atmosphere.lat), len(atmosphere.lon), len(atmosphere.pressure)))),
+        "heating_rate": (("lat", "lon", "pressure"), np.zeros((len(atmosphere.lat), len(atmosphere.lon), len(atmosphere.pressure)))),
+    },
+    coords={"lat": atmosphere.lat, "lon": atmosphere.lon},
+)
+
+# %%
+for lat in atmosphere.lat:
+    for lon in atmosphere.lon:
+        results_lw = LW_flux_simulator.flux_simulator_single_profile(
+            atms_grd[0],
+            atmosphere.sel(lat=lat, lon=lon).isel(pressure=0)["temperature"].values,
+            np.max([-318, atmosphere.sel(lat=lat, lon=lon).isel(pressure=0)["geometric_height"].values]),
+            surface_reflectivity_lw,
+            geographical_position=[lat, lon],
+        )
+
+        fluxes_spectral["flux_upward"].loc[lat, lon] = results_lw["spectral_flux_clearsky_up"].T
+        fluxes_spectral["flux_downward"].loc[lat, lon] = results_lw["spectral_flux_clearsky_down"].T
+        fluxes_integrated["flux_upward"].loc[lat, lon] = results_lw["flux_clearsky_up"]
+        fluxes_integrated["flux_downward"].loc[lat, lon] = results_lw["flux_clearsky_down"]
+        fluxes_integrated["heating_rate"].loc[lat, lon] = results_lw["heating_rate_clearsky"].T
+   
+
 
 
 # %%
